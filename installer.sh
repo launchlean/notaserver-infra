@@ -42,13 +42,54 @@ ui_div() { echo -e "${DIM}──────────────────
 ui_st() { case "$1" in check) echo -e "  ${DIM}Checking:${RESET} $2" ;; progress) echo -e "  ${CYAN}${ARROW} ${RESET}$2" ;; done) echo -e "  ${GREEN}${CHECK} ${RESET}$2" ;; pending) echo -e "  ${YELLOW}${BULL} ${RESET}$2" ;; fail) echo -e "  ${RED}${ERR} ${RESET}$2" ;; esac; }
 
 # ── Input helpers ───────────────────────────────────────────────────────────
-_ti() { local p="$1" d="$2" r; if [ -t 0 ]; then echo -n "$p"; [ -n "$d" ] && echo -n " [$d]: " || echo -n ": "; read -r r; [ -z "$r" ] && r="$d"; echo "$r"; elif [ -r /dev/tty ]; then echo -n "$p" >/dev/tty; [ -n "$d" ] && echo -n " [$d]: " >/dev/tty || echo -n ": " >/dev/tty; read -r r </dev/tty; [ -z "$r" ] && r="$d"; echo "$r"; else [ -n "$d" ] && echo "$d" || echo ""; fi; }
+_ti() { local p="$1" d="$2" r
+    if [ -t 0 ]; then
+        echo -n "$p"; [ -n "$d" ] && echo -n " [$d]: " || echo -n ": "
+        read -r r; [ -z "$r" ] && r="$d"; echo "$r"
+    elif echo >/dev/tty 2>/dev/null; then
+        echo -n "$p" >/dev/tty
+        [ -n "$d" ] && echo -n " [$d]: " >/dev/tty || echo -n ": " >/dev/tty
+        read -r r </dev/tty
+        [ -z "$r" ] && r="$d"
+        echo "$r"
+    else
+        [ -n "$d" ] && echo "$d" || echo ""
+    fi
+}
 
 _tm() { local t="$1"; shift; local o=("$@"); echo ""; echo "$t"; echo "──────────────────────────────────────────────────────────────"; local i=1; for x in "${o[@]}"; do echo "  $i. $x"; i=$((i+1)); done; echo ""; local n; n=$(_rmc "${#o[@]}"); echo "${o[$((n-1))]}"; }
 
-_tc() { local m="$1" d="${2:-y}" r; echo ""; echo "$m"; echo -n "  [${d}/n]: "; read -r r; case "${r:-"$d"}" in [yY]|[yY][eE][sS]) return 0 ;; [nN]|[nN][oO]) return 1 ;; *) return 1 ;; esac; }
+_tc() { local m="$1" d="${2:-y}" r
+    echo ""; echo "$m"; echo -n "  [${d}/n]: "
+    if ! read -r r; then
+        # Non-interactive: use default
+        [ -n "$d" ] && r="$d"
+    fi
+    case "${r:-$d}" in
+        [yY]|[yY][eE][sS]) return 0 ;;
+        [nN]|[nN][oO]) return 1 ;;
+        *) return 1 ;;
+    esac
+}
 
-_rmc() { local mx="$1" c; while true; do c=$(_ti "Select option" ""); [ -z "$c" ] && continue; if [[ "$c" =~ ^[0-9]+$ ]] && [ "$c" -ge 1 ] && [ "$c" -le "$mx" ]; then echo "$c"; return 0; fi; ui_e "Enter a number between 1 and $mx"; done; }
+_rmc() { local mx="$1" c
+    c=$(_ti "Select option" "")
+    if [ -z "$c" ]; then
+        # Non-interactive: fall back to env or fail
+        if [ -n "${INSTALL_TYPE:-}" ]; then
+            echo "$INSTALL_TYPE"
+            return 0
+        fi
+        ui_e "No interactive input available (non-TTY session)."
+        ui_i "Set INSTALL_TYPE=1|2|3 or run interactively."
+        return 1
+    fi
+    if [[ "$c" =~ ^[0-9]+$ ]] && [ "$c" -ge 1 ] && [ "$c" -le "$mx" ]; then
+        echo "$c"; return 0
+    fi
+    ui_e "Enter a number between 1 and $mx"
+    return 1
+}
 
 _ws() { local t="$1"; shift; local o=("$@"); local n=${#o[@]}; local a=(); local i; for i in "${!o[@]}"; do a+=("$((i+1))" "${o[$i]}"); done; local ch; ch=$(whiptail --clear --title "$t" --menu "" 15 65 "$n" "${a[@]}" 3>&1 1>&2 2>&3); if [ $? -ne 0 ]; then echo ""; return 1; fi; echo "$ch"; }
 
@@ -77,11 +118,46 @@ _cknet() { if ! curl -sf --max-time 5 https://github.com >/dev/null 2>&1; then u
 _dnet() { local iface=""; for i in eth0 ens3 ens33 enp0s3 enp0s8 enp4s0; do ip addr show "$i" >/dev/null 2>&1 && { iface="$i"; break; }; done; [ -z "$iface" ] && iface=$(ip -o addr show | grep -v lo | head -1 | awk '{print $2}' | tr -d ':'); local ip=$(ip -o -4 addr show "$iface" 2>/dev/null | grep -v secondary | head -1 | awk '{print $4}' | cut -d/ -f1); local cidr=$(ip -o -4 addr show "$iface" 2>/dev/null | grep -v secondary | head -1 | awk '{print $4}' | cut -d/ -f2); local gw=$(ip route show default 2>/dev/null | awk '{print $3}' | head -1); local dns=$(grep -r 'nameserver' /etc/resolv.conf 2>/dev/null | head -1 | awk '{print $2}' || echo "$gw"); CURRENT_IFACE="$iface"; CURRENT_IP="$ip"; CURRENT_CIDR="${cidr:-24}"; CURRENT_GW="$gw"; CURRENT_DNS="${dns:-$gw}"; }
 
 
+# ── Apt lock handling ───────────────────────────────────────────────────────
+_apt_ready() {
+    local timeout="${1:-60}" waited=0
+    while [ $waited -lt $timeout ]; do
+        # Check if any apt/dpkg/unattended process is running
+        local blocker=$(pgrep -af 'apt|dpkg|unattended-upgrade' 2>/dev/null | grep -v pgrep | grep -v "bash -c" | head -1)
+        if [ -z "$blocker" ]; then
+            # No blocker — try to acquire lock
+            if apt-get update -qq >/dev/null 2>&1; then
+                return 0
+            fi
+            # Lock files may still exist without a process — clean them
+            rm -f /var/lib/apt/lists/lock /var/cache/apt/archives/lock \
+                /var/lib/dpkg/lock-frontend /var/lib/dpkg/lock 2>/dev/null
+            if apt-get update -qq >/dev/null 2>&1; then
+                return 0
+            fi
+        fi
+        # Has blocker — try to clear stale locks and wait
+        rm -f /var/lib/apt/lists/lock /var/cache/apt/archives/lock \
+            /var/lib/dpkg/lock-frontend /var/lib/dpkg/lock 2>/dev/null
+        dpkg --configure -a >/dev/null 2>&1 || true
+        sleep 2; waited=$((waited + 2))
+    done
+    ui_e "apt is blocked and could not be unlocked within ${timeout}s"
+    ui_i "Check: ps aux | grep -E 'apt|dpkg|unattended'"
+    return 1
+}
+
 # ── Step 1: System prep ─────────────────────────────────────────────────────
 step_system() {
     ui_h "STEP 1 — SYSTEM PREPARATION"
-    ui_st progress "Updating package lists"
-    apt-get update -qq >/dev/null 2>&1; _log "[1] apt-update: done"; ui_s "Package lists updated"
+    ui_st progress "Preparing package manager (checking for locks...)"
+    if ! _apt_ready 90; then
+        ui_e "Cannot proceed — apt package manager is blocked."
+        ui_i "Resolve the blocking process and re-run: sudo bash $INSTALLER_PATH --resume"
+        _log "[1] apt: BLOCKED — cannot proceed"
+        exit 1
+    fi
+    _log "[1] apt-update: done"; ui_s "Package lists updated"
     local want_upgrade="no" want_tools="no"
     if [ "${INSTALL_TYPE:-custom}" != "quick" ]; then
         _ay "Upgrade existing packages?" "no" && want_upgrade="yes"; echo ""
