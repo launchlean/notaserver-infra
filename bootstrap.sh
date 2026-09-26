@@ -13,7 +13,12 @@ TEMP_DIR=""
 
 log() { echo "$1"; }
 
-cleanup() { [ -n "$TEMP_DIR" ] && [ -d "$TEMP_DIR" ] && rm -rf "$TEMP_DIR"; }
+cleanup() {
+    # Only clean downloads, NOT the installer — keep it for --resume
+    rm -f "$INSTALLER_PATH.sha256"
+    # Remove temp dir contents except installer.sh
+    [ -n "$TEMP_DIR" ] && [ -d "$TEMP_DIR" ] && find "$TEMP_DIR" -mindepth 1 -maxdepth 1 -not -name installer.sh -delete 2>/dev/null || true
+}
 trap cleanup EXIT
 
 fetch_with_cachebust() {
@@ -118,13 +123,17 @@ fi
 log ""
 chmod +x "$INSTALLER_PATH"
 
+# Save installer to a stable location so --resume works
+cp "$INSTALLER_PATH" "/tmp/notaserver-setup/installer.sh" 2>/dev/null || true
+mkdir -p "/tmp/notaserver-setup"
+
 log "Starting installer..."
 log ""
 
 if [ "${NON_INTERACTIVE:-}" = "true" ] || [ "${NON_INTERACTIVE:-}" = "1" ]; then
-    ./"$INSTALLER_PATH" --non-interactive "$@"
+    "/tmp/notaserver-setup/installer.sh" --non-interactive "$@"
 else
-    ./"$INSTALLER_PATH" "$@"
+    "/tmp/notaserver-setup/installer.sh" "$@"
 fi
 
 EXIT_CODE=$?
